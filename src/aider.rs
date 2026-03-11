@@ -8,12 +8,52 @@ use std::sync::mpsc;
 use anyhow::Result;
 use eframe::egui;
 use tokio::sync::mpsc as tokio_mpsc;
+use serde_json;
 
 use editor::{apply_edits, parse_edits, EditFormat};
 use git_ops::GitRepo;
 use llm::{system_prompt_for_edit_format, LlmClient, LlmConfig, Message, OpenAiClient};
 
 use crate::app::AppMsg;
+use crate::kb;
+
+// ─── DuckDuckGo-sökning ───────────────────────────────────────────────────────
+
+async fn web_search(query: &str) -> String {
+    let url = format!(
+        "https://api.duckduckgo.com/?q={}&format=json&no_redirect=1&no_html=1",
+        urlencoding::encode(query)
+    );
+    let Ok(resp) = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(8))
+        .build()
+        .unwrap()
+        .get(&url)
+        .header("User-Agent", "matsux-term/0.1")
+        .send()
+        .await
+    else { return String::new() };
+
+    let Ok(json) = resp.json::<serde_json::Value>().await else { return String::new() };
+
+    let mut result = String::new();
+
+    // AbstractText — kort sammanfattning
+    if let Some(abs) = json["AbstractText"].as_str().filter(|s| !s.is_empty()) {
+        result.push_str(&format!("**{abs}**\n\n"));
+    }
+
+    // RelatedTopics — de 5 första relevanta träffarna
+    if let Some(topics) = json["RelatedTopics"].as_array() {
+        for topic in topics.iter().take(5) {
+            if let Some(text) = topic["Text"].as_str().filter(|s| !s.is_empty()) {
+                result.push_str(&format!("- {text}\n"));
+            }
+        }
+    }
+
+    result
+}
 
 // ─── Request type ─────────────────────────────────────────────────────────────
 
@@ -96,6 +136,38 @@ async fn handle(
         format!("{}\n\n{context}", req.goal)
     };
 
+    // Sök i lokal kunskapsbas efter relevanta tidigare exempel.
+    send(tx, AppMsg::StatusSet("Söker i kunskapsbas…".into()), ctx);
+    let kb_context = kb::search(&req.goal, 3);
+    if !kb_context.is_empty() {
+        log(&format!("→ KB-träff hittad ({} tecken)", kb_context.len()));
+    }
+
+    // Webbsökning för programmerings-relaterade frågor.
+    send(tx, AppMsg::StatusSet("Söker på webben…".into()), ctx);
+    let search_query = format!("{} programming example", req.goal);
+    let web_context = web_search(&search_query).await;
+    if !web_context.is_empty() {
+        log(&format!("→ Webbsökning: {} tecken", web_context.len()));
+    }
+
+    // Bygg slutlig kontext: KB + webb + filer.
+    let mut extra = String::new();
+    if !kb_context.is_empty() {
+        extra.push_str(&kb_context);
+    }
+    if !web_context.is_empty() {
+        extra.push_str("### Webbsökning\n\n");
+        extra.push_str(&web_context);
+        extra.push('\n');
+    }
+
+    let user_msg = if extra.is_empty() {
+        user_msg
+    } else {
+        format!("{user_msg}\n\n{extra}")
+    };
+
     send(tx, AppMsg::StatusSet("Väntar på AI…".into()), ctx);
     log("→ skickar till Ollama…");
 
@@ -147,6 +219,17 @@ async fn handle(
     match apply_edits(&edits, false) {
         Ok(_) => log("→ apply_edits OK"),
         Err(e) => { log(&format!("→ apply_edits FEL: {e}")); return Err(e); }
+    }
+
+    // Spara lyckade kodfiler till kunskapsbasen så AI:n lär sig.
+    for edit in &edits {
+        if let Ok(content) = std::fs::read_to_string(&edit.filename) {
+            if let Err(e) = kb::save(&req.goal, &edit.filename, &content) {
+                log(&format!("→ KB-sparning misslyckades: {e}"));
+            } else {
+                log(&format!("→ KB: sparade {:?}", edit.filename));
+            }
+        }
     }
 
     send(

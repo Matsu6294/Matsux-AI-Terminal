@@ -22,7 +22,12 @@ git-ops = { path = "../matsux-aider/crates/git" }
 
 # Config persistence
 serde       = { version = "1", features = ["derive"] }
+serde_json  = "1"
 toml        = "0.8"
+
+# HTTP — web search & doc fetching
+reqwest      = { version = "0.12", features = ["json", "rustls-tls"], default-features = false }
+urlencoding  = "2"
 
 # Utilities
 anyhow             = "1"

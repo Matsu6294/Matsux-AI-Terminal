@@ -11,6 +11,7 @@ mod app;
 mod aider;
 mod cargo_runner;
 mod config;
+mod kb;
 
 use std::path::PathBuf;
 use eframe::egui;
