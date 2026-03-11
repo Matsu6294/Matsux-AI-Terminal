@@ -1,4 +1,4 @@
-# matsux-term
+# matsux-ai-terminal
 
 **Standalone AI-kodassistent byggd i Rust 1.94.0** — öppnas med dubbelklick, inget terminal-fönster behövs.
 
