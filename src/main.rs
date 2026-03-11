@@ -12,6 +12,7 @@ mod aider;
 mod cargo_runner;
 mod config;
 mod kb;
+mod matsux_log;
 
 use std::path::PathBuf;
 use eframe::egui;

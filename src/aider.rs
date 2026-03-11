@@ -16,6 +16,7 @@ use llm::{system_prompt_for_edit_format, LlmClient, LlmConfig, Message, OpenAiCl
 
 use crate::app::AppMsg;
 use crate::kb;
+use crate::matsux_log;
 
 // ─── DuckDuckGo-sökning ───────────────────────────────────────────────────────
 
@@ -81,6 +82,7 @@ pub async fn run(
         tokio::spawn(async move {
             if let Err(e) = handle(req, &tx2, &ctx2).await {
                 log(&format!("handle() fel: {e}"));
+                let _ = matsux_log::append("(fel)", &[], &format!("fel: {e}"));
                 send(&tx2, AppMsg::Error(e.to_string()), &ctx2);
             }
         });
@@ -143,6 +145,9 @@ async fn handle(
         log(&format!("→ KB-träff hittad ({} tecken)", kb_context.len()));
     }
 
+    // Hämta matsux-log så AI:n vet vad den gjort tidigare.
+    let log_context = matsux_log::summary_for_context(15);
+
     // Webbsökning för programmerings-relaterade frågor.
     send(tx, AppMsg::StatusSet("Söker på webben…".into()), ctx);
     let search_query = format!("{} programming example", req.goal);
@@ -151,8 +156,11 @@ async fn handle(
         log(&format!("→ Webbsökning: {} tecken", web_context.len()));
     }
 
-    // Bygg slutlig kontext: KB + webb + filer.
+    // Bygg slutlig kontext: logg + KB + webb + filer.
     let mut extra = String::new();
+    if !log_context.is_empty() {
+        extra.push_str(&log_context);
+    }
     if !kb_context.is_empty() {
         extra.push_str(&kb_context);
     }
@@ -222,6 +230,7 @@ async fn handle(
     }
 
     // Spara lyckade kodfiler till kunskapsbasen så AI:n lär sig.
+    let file_paths: Vec<&std::path::Path> = edits.iter().map(|e| e.filename.as_path()).collect();
     for edit in &edits {
         if let Ok(content) = std::fs::read_to_string(&edit.filename) {
             if let Err(e) = kb::save(&req.goal, &edit.filename, &content) {
@@ -231,6 +240,9 @@ async fn handle(
             }
         }
     }
+
+    // Skriv till matsux-log.
+    let _ = matsux_log::append(&req.goal, &file_paths, "ok");
 
     send(
         tx,
