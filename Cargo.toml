@@ -1,0 +1,30 @@
+[package]
+name = "matsux-term"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.94.0"
+
+[[bin]]
+name = "matsux-term"
+path = "src/main.rs"
+
+[dependencies]
+# GUI — opens as a native window on double-click
+eframe = { version = "0.29", features = ["default_fonts"] }
+
+# Async runtime
+tokio = { version = "1", features = ["full"] }
+
+# matsux-aider crates — no mistral-backend feature
+llm     = { path = "../matsux-aider/crates/llm" }
+editor  = { path = "../matsux-aider/crates/editor" }
+git-ops = { path = "../matsux-aider/crates/git" }
+
+# Config persistence
+serde       = { version = "1", features = ["derive"] }
+toml        = "0.8"
+
+# Utilities
+anyhow             = "1"
+tracing            = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }

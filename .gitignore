@@ -1,0 +1,19 @@
+# Rust build artifacts
+/target/
+
+# Config with potential secrets — use ~/.matsux-term.toml instead
+.matsux-term.toml
+
+# Logs
+*.log
+/tmp/matsux-term.log
+
+# Editor files
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS files
+.DS_Store
+Thumbs.db
