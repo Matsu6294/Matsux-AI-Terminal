@@ -66,6 +66,9 @@ pub struct App {
     msg_rx: mpsc::Receiver<AppMsg>,
     cargo_tx: tokio_mpsc::Sender<CargoCmd>,
 
+    // Keep the tokio runtime alive for the entire lifetime of the app.
+    _rt: tokio::runtime::Runtime,
+
     // Cargo / toolchain
     pub toolchain_channel: String,
     toolchain_input: String,
@@ -78,30 +81,35 @@ pub struct App {
     selected_provider: usize,
 }
 
+// ─── App::new() ──────────────────────────────────────────────────────────────
+
 impl App {
     pub fn new(
         repo_path: PathBuf,
         req_tx: tokio_mpsc::Sender<AiderRequest>,
         msg_rx: mpsc::Receiver<AppMsg>,
         cargo_tx: tokio_mpsc::Sender<CargoCmd>,
+        rt: tokio::runtime::Runtime,
     ) -> Self {
-        let model = std::env::var("MATSUX_MODEL")
-            .or_else(|_| std::env::var("OPENAI_MODEL"))
-            .unwrap_or_else(|_| "gpt-4o".to_string());
+        let toolchain_channel = cargo_runner::read_toolchain(&repo_path)
+            .unwrap_or_else(|| "stable".to_string());
+        let toolchain_input = toolchain_channel.clone();
+
+        let cfg = config::load();
+        let model = cfg.model.clone();
+
+        // Persist last used repo path so double-click launch reopens it.
+        {
+            let mut cfg_save = cfg.clone();
+            cfg_save.last_repo_path = Some(repo_path.display().to_string());
+            let _ = config::save(&cfg_save);
+        }
 
         let welcome = format!(
             "matsux-term  •  {}  •  modell: {}",
             repo_path.display(),
             model
         );
-
-        let toolchain_channel = cargo_runner::read_toolchain(&repo_path)
-            .unwrap_or_else(|| "stable".to_string());
-        let toolchain_input = toolchain_channel.clone();
-
-        let cfg = config::load();
-        // Derive initial model from cfg (overrides MATSUX_MODEL env)
-        let model = cfg.model.clone();
 
         let mut app = App {
             repo_path,
@@ -119,6 +127,7 @@ impl App {
             req_tx,
             msg_rx,
             cargo_tx,
+            _rt: rt,
             toolchain_channel,
             toolchain_input,
             installed_toolchains: Vec::new(),
@@ -138,6 +147,7 @@ impl App {
         self.files = files;
     }
 
+    // ─── drain_messages() ────────────────────────────────────────────────────
     fn drain_messages(&mut self) {
         while let Ok(msg) = self.msg_rx.try_recv() {
             match msg {
@@ -180,6 +190,7 @@ impl App {
         }
     }
 
+    // ─── submit() ────────────────────────────────────────────────────────────
     fn submit(&mut self) {
         let text = self.input.trim().to_string();
         if text.is_empty() || self.busy { return; }
@@ -200,7 +211,11 @@ impl App {
             api_key: self.cfg.api_key.clone(),
             base_url: self.cfg.base_url.clone(),
         };
-        let _ = self.req_tx.try_send(req);
+        log(&format!("submit: model={} base_url={} api_key_len={}", self.cfg.model, self.cfg.base_url, self.cfg.api_key.len()));
+        match self.req_tx.try_send(req) {
+            Ok(_) => log("try_send OK"),
+            Err(e) => log(&format!("try_send FEL: {e}")),
+        }
     }
 }
 
@@ -483,9 +498,8 @@ impl eframe::App for App {
                                     if !p.base_url.is_empty() {
                                         self.cfg.base_url = p.base_url.to_string();
                                     }
-                                    if !p.key_hint.is_empty() && self.cfg.api_key.is_empty() {
-                                        // Only set key hint if field is empty
-                                    }
+                                    // For Ollama (and similar local providers) auto-fill the key.
+                                    self.cfg.api_key = p.key_hint.to_string();
                                     // Set first model as default
                                     if let Some(m) = p.models.first() {
                                         self.cfg.model = m.to_string();
@@ -633,11 +647,11 @@ impl eframe::App for App {
         // ── Central panel: chat + input ───────────────────────────────────────
         egui::CentralPanel::default().show(ctx, |ui| {
             let total_h = ui.available_height();
-            let input_h = 50.0;
+            let bottom_h = 70.0;
 
             // Chat history (scrollable, sticks to bottom).
             egui::ScrollArea::vertical()
-                .max_height(total_h - input_h - 8.0)
+                .max_height(total_h - bottom_h)
                 .stick_to_bottom(true)
                 .show(ui, |ui| {
                     for line in &self.chat {
@@ -646,6 +660,11 @@ impl eframe::App for App {
                 });
 
             ui.separator();
+
+            // Rensa-knapp på egen rad.
+            if ui.small_button("🗑 rensa chatt").clicked() {
+                self.chat.clear();
+            }
 
             // Input row.
             ui.horizontal(|ui| {
@@ -660,13 +679,11 @@ impl eframe::App for App {
 
                 let resp = ui.add_enabled(!self.busy, input_widget);
 
-                // Auto-focus on start and after submit.
                 if self.request_focus {
                     resp.request_focus();
                     self.request_focus = false;
                 }
 
-                // Enter key submits.
                 if resp.lost_focus() && ctx.input(|i| i.key_pressed(egui::Key::Enter)) {
                     self.submit();
                 }
@@ -682,7 +699,7 @@ impl eframe::App for App {
     }
 }
 
-// ─── Rendering helpers ────────────────────────────────────────────────────────
+// ─── render_chat_line() ──────────────────────────────────────────────────────
 
 fn render_chat_line(ui: &mut egui::Ui, line: &ChatLine) {
     let (role_color, role_label) = match line.role.as_str() {
@@ -716,7 +733,7 @@ fn render_chat_line(ui: &mut egui::Ui, line: &ChatLine) {
     ui.add_space(4.0);
 }
 
-// ─── File scanner ─────────────────────────────────────────────────────────────
+// ─── walk_dir() and constants ────────────────────────────────────────────────
 
 const CODE_EXTS: &[&str] = &[
     "rs", "py", "js", "ts", "jsx", "tsx", "go", "c", "cpp", "h", "hpp",
@@ -741,11 +758,25 @@ fn walk_dir(root: &Path, dir: &Path, out: &mut Vec<PathBuf>, depth: usize) {
             walk_dir(root, &path, out, depth + 1);
         } else {
             let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
+            if ext.is_empty() { continue; } // skip binaries with no extension
             if CODE_EXTS.contains(&ext) {
                 if let Ok(rel) = path.strip_prefix(root) {
                     out.push(rel.to_path_buf());
                 }
             }
         }
+    }
+}
+
+// ─── log() helper ────────────────────────────────────────────────────────────
+
+fn log(msg: &str) {
+    use std::io::Write;
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open("/tmp/matsux-term.log")
+    {
+        let _ = writeln!(f, "[app] {}", msg);
     }
 }

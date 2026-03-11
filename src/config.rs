@@ -4,11 +4,15 @@
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
+// ─── Config struct ────────────────────────────────────────────────────────────
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
     pub api_key: String,
     pub base_url: String,
     pub model: String,
+    #[serde(default)]
+    pub last_repo_path: Option<String>,
 }
 
 impl Default for Config {
@@ -20,9 +24,12 @@ impl Default for Config {
             model: std::env::var("MATSUX_MODEL")
                 .or_else(|_| std::env::var("OPENAI_MODEL"))
                 .unwrap_or_else(|_| "gpt-4o".to_string()),
+            last_repo_path: None,
         }
     }
 }
+
+// ─── Persistence ─────────────────────────────────────────────────────────────
 
 fn config_path() -> PathBuf {
     let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
@@ -80,6 +87,7 @@ pub const PROVIDERS: &[Provider] = &[
         name: "Ollama (lokal)",
         base_url: "http://localhost:11434/v1",
         models: &[
+            "qwen2.5:1.5b",
             "qwen2.5-coder:1.5b",
             "qwen2.5-coder:3b",
             "qwen2.5-coder:7b",

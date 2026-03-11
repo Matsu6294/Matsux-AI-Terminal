@@ -33,18 +33,31 @@ pub async fn run(
     tx: mpsc::Sender<AppMsg>,
     ctx: egui::Context,
 ) {
+    log("aider::run() startad");
     while let Some(req) = rx.recv().await {
+        log(&format!("aider::run() fick förfrågan: {}", req.goal));
         let tx2 = tx.clone();
         let ctx2 = ctx.clone();
         tokio::spawn(async move {
             if let Err(e) = handle(req, &tx2, &ctx2).await {
+                log(&format!("handle() fel: {e}"));
                 send(&tx2, AppMsg::Error(e.to_string()), &ctx2);
             }
         });
     }
+    log("aider::run() avslutad (kanal stängd)");
 }
 
-// ─── Single request ───────────────────────────────────────────────────────────
+// ─── log() helper ────────────────────────────────────────────────────────────
+
+fn log(msg: &str) {
+    use std::io::Write;
+    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open("/tmp/matsux-term.log") {
+        let _ = writeln!(f, "{}", msg);
+    }
+}
+
+// ─── handle() ────────────────────────────────────────────────────────────────
 
 async fn handle(
     req: AiderRequest,
@@ -52,6 +65,7 @@ async fn handle(
     ctx: &egui::Context,
 ) -> Result<()> {
     send(tx, AppMsg::StatusSet("Läser kontext…".into()), ctx);
+    log("→ handle() start");
 
     // Build file context.
     let mut context = String::new();
@@ -65,9 +79,9 @@ async fn handle(
     // Build LLM client — uses api_key and base_url from app settings (no env vars).
     let config = LlmConfig {
         model_name: req.model.clone(),
-        max_tokens: 4096,
+        max_tokens: 1024,
         temperature: 0.0,
-        system_prompt: system_prompt_for_edit_format("editblock").to_string(),
+        system_prompt: system_prompt_for_edit_format("wholefile").to_string(),
     };
     if req.api_key.is_empty() {
         return Err(anyhow::anyhow!(
@@ -83,8 +97,10 @@ async fn handle(
     };
 
     send(tx, AppMsg::StatusSet("Väntar på AI…".into()), ctx);
+    log("→ skickar till Ollama…");
 
     let response = client.chat(&[Message::user(user_msg)]).await?;
+    log(&format!("→ svar mottaget ({} tecken)", response.len()));
 
     send(
         tx,
@@ -92,25 +108,46 @@ async fn handle(
         ctx,
     );
 
-    // Parse edits.
-    let mut edits = parse_edits(&response, EditFormat::EditBlock)?;
+    // Parse edits — if the model didn't follow the editblock format, show the
+    // response as plain chat and finish gracefully.
+    let mut edits = match parse_edits(&response, EditFormat::WholeFile) {
+        Ok(e) => { log(&format!("→ parse_edits ok: {} edit(s)", e.len())); e }
+        Err(e) => {
+            log(&format!("→ parse_edits fel: {e}"));
+            return Ok(());
+        }
+    };
 
     if edits.is_empty() {
         send(tx, AppMsg::StatusSet("Klar ✓ (inga kodfiler ändrades)".into()), ctx);
         return Ok(());
     }
 
-    // Resolve paths.
+    // Resolve paths — always place files inside repo_path (filer/).
     for edit in &mut edits {
-        if edit.filename.is_relative() {
-            edit.filename = req.repo_path.join(&edit.filename);
-        }
+        log(&format!("→ edit path (före): {:?}", edit.filename));
+        let filename = edit.filename.clone();
+        // Strip any leading absolute prefix so everything lands in filer/.
+        let relative = if filename.is_absolute() {
+            filename
+                .file_name()
+                .map(std::path::Path::new)
+                .unwrap_or(&filename)
+                .to_path_buf()
+        } else {
+            filename
+        };
+        edit.filename = req.repo_path.join(relative);
+        log(&format!("→ edit path (efter): {:?}", edit.filename));
     }
 
     let n = edits.len();
     send(tx, AppMsg::StatusSet(format!("Applicerar {n} edit(s)…")), ctx);
 
-    apply_edits(&edits, false)?;
+    match apply_edits(&edits, false) {
+        Ok(_) => log("→ apply_edits OK"),
+        Err(e) => { log(&format!("→ apply_edits FEL: {e}")); return Err(e); }
+    }
 
     send(
         tx,
@@ -120,6 +157,44 @@ async fn handle(
         },
         ctx,
     );
+
+    // Auto-compile .rs files with rustc — output binary goes to filer/.
+    for edit in &edits {
+        if edit.filename.extension().and_then(|e| e.to_str()) == Some("rs") {
+            let stem = edit.filename.file_stem().unwrap_or_default();
+            let out = req.repo_path.join(stem);
+            log(&format!("→ kompilerar {:?} → {:?}", edit.filename, out));
+            send(tx, AppMsg::StatusSet(format!("Kompilerar {}…", edit.filename.display())), ctx);
+            let result = std::process::Command::new("rustc")
+                .arg(&edit.filename)
+                .arg("-o").arg(&out)
+                .output();
+            match result {
+                Ok(out_result) if out_result.status.success() => {
+                    log("→ rustc OK");
+                    send(tx, AppMsg::ChatAppend {
+                        role: "sys".into(),
+                        text: format!("✅ Kompilerad → {}", out.display()),
+                    }, ctx);
+                }
+                Ok(out_result) => {
+                    let err = String::from_utf8_lossy(&out_result.stderr).to_string();
+                    log(&format!("→ rustc FEL: {err}"));
+                    send(tx, AppMsg::ChatAppend {
+                        role: "sys".into(),
+                        text: format!("❌ Kompileringsfel:\n{err}"),
+                    }, ctx);
+                }
+                Err(e) => {
+                    log(&format!("→ rustc kunde inte starta: {e}"));
+                    send(tx, AppMsg::ChatAppend {
+                        role: "sys".into(),
+                        text: format!("❌ Kunde inte starta rustc: {e}"),
+                    }, ctx);
+                }
+            }
+        }
+    }
 
     // Auto-commit.
     let changed: Vec<PathBuf> = edits.iter().map(|e| e.filename.clone()).collect();
@@ -166,7 +241,7 @@ async fn handle(
     Ok(())
 }
 
-// ─── Helper ───────────────────────────────────────────────────────────────────
+// ─── send() helper ───────────────────────────────────────────────────────────
 
 fn send(tx: &mpsc::Sender<AppMsg>, msg: AppMsg, ctx: &egui::Context) {
     let _ = tx.send(msg);

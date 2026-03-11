@@ -29,11 +29,8 @@ fn main() -> eframe::Result<()> {
             .try_init();
     }
 
-    // Determine working repo directory.
-    let repo_path: PathBuf = std::env::args()
-        .nth(1)
-        .map(PathBuf::from)
-        .unwrap_or_else(|| std::env::current_dir().expect("cwd"));
+    // Always use the fixed files directory.
+    let repo_path: PathBuf = PathBuf::from("/home/matsu/matsux-os/filer");
 
     // Build a multi-thread tokio runtime that lives as long as the app.
     let rt = tokio::runtime::Builder::new_multi_thread()
@@ -62,11 +59,9 @@ fn main() -> eframe::Result<()> {
         Box::new(move |cc| {
             setup_style(&cc.egui_ctx);
             let ctx = cc.egui_ctx.clone();
-            // Spawn aider task — calls ctx.request_repaint() on each message.
             rt.spawn(aider::run(req_rx, msg_tx.clone(), ctx.clone()));
-            // Spawn cargo runner task — shares same msg channel.
             rt.spawn(cargo_runner::run(cargo_rx, msg_tx, ctx.clone()));
-            Ok(Box::new(app::App::new(repo_path, req_tx, msg_rx, cargo_tx)))
+            Ok(Box::new(app::App::new(repo_path, req_tx, msg_rx, cargo_tx, rt)))
         }),
     )
 }
