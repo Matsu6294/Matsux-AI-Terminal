@@ -151,7 +151,8 @@ async fn run_cargo(
 
 fn notify(tx: &mpsc::Sender<AppMsg>, msg: AppMsg, ctx: &egui::Context) {
     let _ = tx.send(msg);
-    ctx.request_repaint();
+    // Coalesce rapid line-by-line output into a single repaint to prevent flickering.
+    ctx.request_repaint_after(std::time::Duration::from_millis(50));
 }
 
 /// Prefix cargo output lines with a visual hint based on content.

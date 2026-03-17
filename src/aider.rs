@@ -340,5 +340,6 @@ async fn handle(
 
 fn send(tx: &mpsc::Sender<AppMsg>, msg: AppMsg, ctx: &egui::Context) {
     let _ = tx.send(msg);
-    ctx.request_repaint(); // Wake up the GUI immediately.
+    // Coalesce multiple rapid messages into a single repaint to prevent flickering.
+    ctx.request_repaint_after(std::time::Duration::from_millis(50));
 }
